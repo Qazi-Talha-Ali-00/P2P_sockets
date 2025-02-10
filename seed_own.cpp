@@ -113,6 +113,7 @@ void handle_client(int client_socket_fd, sockaddr_in client_addr){
     ofstream fout("log.txt",ios::app);
     if(!fout){
         cout<<"Error opening the file";
+        m.unlock();
         return;
     }
     fout<<"New peer registered "<<client_ip<<": "<<client_port<<endl;
