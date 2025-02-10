@@ -7,31 +7,87 @@
 #include<fstream>
 
 using namespace std;
-map<string, int> peer_list;
+map<string, int> peer_list;     // Stores {IP → Port}
+map<string, int> peer_sockets;  // Stores {IP → socket FD}
 mutex m;
-bool isalive(string ip, string port){
-    return true;
+bool isalive(string ip) {
+    m.lock();
+    if (peer_sockets.find(ip) == peer_sockets.end()) {
+        m.unlock();
+        return false;  // No existing connection, assume dead
+    }
+    
+    int sockfd = peer_sockets[ip];  // Get the existing socket FD
+    m.unlock();
+
+    string ping_msg = "PING";
+    send(sockfd, ping_msg.c_str(), ping_msg.length(), 0);
+
+    char buffer[10] = {0};
+    struct timeval timeout;
+    timeout.tv_sec = 2;  // 2-second timeout
+    timeout.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+
+    int bytes_received = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
+
+    return (bytes_received > 0 && string(buffer) == "PONG");
 }
-void handle_dead_node(string& message){
+
+void handle_dead_node(string& message) {
     istringstream iss(message);
     string token;
     vector<string> tokens;
 
-    // Split the message by ':'
     while (getline(iss, token, ':')) {
         tokens.push_back(token);
     }
+
+    if (tokens.size() < 5) {
+        cout << "Invalid dead node message format!" << endl;
+        return;
+    }
+
+    string dead_ip = tokens[1];
+    int dead_port = stoi(tokens[2]);
+
+    // Check if the node exists in peer_list
     m.lock();
-    if(peer_list.count(tokens[1]) == 0){
+    if (peer_list.find(dead_ip) == peer_list.end()) {
         m.unlock();
         return;
-     }
+    }
     m.unlock();
-    // now we have to delete this node from the p2p network
-    // first check if it is actually dead.
-    // send the ip and port
-    isalive(tokens[1],tokens[2]);
+
+    // Verify if the node is actually dead
+    if (!isalive(dead_ip) || !isalive(dead_ip)) {
+        // Remove from peer_list
+        m.lock();
+        peer_list.erase(dead_ip);
+        peer_sockets.erase(dead_ip);
+        m.unlock();
+
+        // Log the removal
+        m.lock();
+        ofstream fout("log.txt", ios::app);
+        if (fout) {
+            fout << "Dead node removed: " << dead_ip << ":" << dead_port << endl;
+            fout.close();
+        }
+        m.unlock();
+        // cout << "Confirmed dead and removed: " << dead_ip << ":" << dead_port << endl;
+    } else {
+        m.lock();
+        ofstream fout("log.txt", ios::app);
+        if(fout){
+            fout<<"False alarm: "<<dead_ip<<" is still alive."<<endl;
+            fout<<"False alarm given by "<<tokens[4]<<" for "<<dead_ip<<endl;
+        }
+        m.unlock();
+        // cout << "False alarm: " << dead_ip << " is still alive." << endl;
+    }
 }
+
 void handle_client(int client_socket_fd, sockaddr_in client_addr){
     // get the client ip and port number from the client_add struct
     char client_ip[INET_ADDRSTRLEN];
@@ -46,13 +102,15 @@ void handle_client(int client_socket_fd, sockaddr_in client_addr){
     m.unlock();
     // first send this peer list to the peer
     send(client_socket_fd, peer_list_msg.c_str(), peer_list_msg.length(), 0);
+    
     // now push this clien into our own peer list.
      m.lock();
     peer_list[client_ip] = client_port;
+    peer_sockets[client_ip] = client_socket_fd;
     m.unlock();
     // write in the log file that a new peer has been registered.
     m.lock();
-    ofstream fout("log.txt");
+    ofstream fout("log.txt",ios::app);
     if(!fout){
         cout<<"Error opening the file";
         return;
