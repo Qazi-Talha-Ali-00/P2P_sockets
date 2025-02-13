@@ -23,9 +23,16 @@ private:
     string self_ip;
     int self_port;
     int msg_count = 0;
-    unordered_map<string, int> connected_peers;  // IP -> Port
-    unordered_map<string, int> seed_connections; // IP -> Socket FD
-    unordered_map<string, int> peer_connections; // IP -> Socket FD
+    // Stores peers discovered via seed responses (IP -> Port)
+    unordered_map<string, int> connected_peers;
+    // Active seed connections (IP -> Socket FD)
+    unordered_map<string, int> seed_connections;
+    // Active peer connections (IP -> Socket FD)
+    unordered_map<string, int> peer_connections;
+    // Custom ping tracking: count consecutive ping failures and flag for current round.
+    unordered_map<string, int> ping_failures;
+    unordered_map<string, bool> ping_received;
+    
     unordered_map<string, MessageEntry> message_list;
     mutex mtx;
     ofstream log_file;
@@ -41,49 +48,67 @@ private:
         return to_string(hasher(message));
     }
 
+    // Custom ping functionality:
+    // For each peer connection, send a "PING" message,
+    // wait for a short period for a "PONG" response (handled in handleIncomingMessages),
+    // and update a failure counter. If a peer fails 3 rounds, it is marked dead.
     void pingPeers() {
         while (true) {
+            // Wait before starting a ping round.
             this_thread::sleep_for(chrono::seconds(13));
             vector<string> dead_peers;
             
-            mtx.lock();
-            for (const auto& peer : peer_connections) {
-                int failed_attempts = 0;
-                string peer_ip = peer.first;
-                
-                for (int i = 0; i < 3; i++) {
-                    string cmd = "ping -c 1 -W 2 " + peer_ip;
-                    if (system((cmd + " >/dev/null 2>&1").c_str()) != 0) {
-                        failed_attempts++;
-                    }
-                }
-
-                if (failed_attempts == 3) {
-                    dead_peers.push_back(peer_ip);
+            {
+                lock_guard<mutex> lock(mtx);
+                // For each peer, send a "PING" message and mark as not received.
+                for (auto& p : peer_connections) {
+                    send(p.second, "PING", 4, 0);
+                    ping_received[p.first] = false;
                 }
             }
-            mtx.unlock();
-
+            // Wait 2 seconds for responses.
+            this_thread::sleep_for(chrono::seconds(2));
+            
+            {
+                lock_guard<mutex> lock(mtx);
+                for (auto& p : peer_connections) {
+                    if (!ping_received[p.first]) {
+                        ping_failures[p.first]++;
+                        log_file << "No PONG received from " << p.first 
+                                 << ". Failure count: " << ping_failures[p.first] << endl;
+                        if (ping_failures[p.first] >= 3) {
+                            dead_peers.push_back(p.first);
+                        }
+                    } else {
+                        ping_failures[p.first] = 0; // Reset on success.
+                    }
+                    // Reset flag for next round.
+                    ping_received[p.first] = false;
+                }
+            }
+            
+            // Handle dead peers.
             for (const string& dead_peer : dead_peers) {
                 auto now = chrono::system_clock::now();
                 auto timestamp = chrono::system_clock::to_time_t(now);
                 string dead_msg = "Dead Node:" + dead_peer + ":" + 
                                 to_string(connected_peers[dead_peer]) + ":" +
                                 to_string(timestamp) + ":" + self_ip;
-                
-                mtx.lock();
-                // Notify seeds
-                for (const auto& seed : seed_connections) {
-                    send(seed.second, dead_msg.c_str(), dead_msg.length(), 0);
+                {
+                    lock_guard<mutex> lock(mtx);
+                    // Notify all connected seeds about the dead node.
+                    for (const auto& seed : seed_connections) {
+                        send(seed.second, dead_msg.c_str(), dead_msg.length(), 0);
+                    }
+                    if (peer_connections.count(dead_peer)) {
+                        close(peer_connections[dead_peer]);
+                        peer_connections.erase(dead_peer);
+                        ping_failures.erase(dead_peer);
+                        ping_received.erase(dead_peer);
+                    }
+                    connected_peers.erase(dead_peer);
+                    log_file << "Dead node detected: " << dead_peer << endl;
                 }
-                
-                // Cleanup
-                close(peer_connections[dead_peer]);
-                peer_connections.erase(dead_peer);
-                connected_peers.erase(dead_peer);
-                
-                log_file << "Dead node detected: " << dead_peer << endl;
-                mtx.unlock();
             }
         }
     }
@@ -94,59 +119,71 @@ private:
             string message = generateMessage();
             string msg_hash = calculateHash(message);
             
-            mtx.lock();
-            message_list[msg_hash] = MessageEntry{msg_hash, {}, {}};
-            
-            // Broadcast to peers
-            for (const auto& peer : peer_connections) {
-                send(peer.second, message.c_str(), message.length(), 0);
-                message_list[msg_hash].sentTo.insert(peer.first);
+            {
+                lock_guard<mutex> lock(mtx);
+                message_list[msg_hash] = MessageEntry{msg_hash, {}, {}};
+                // Broadcast the message to all connected peers.
+                for (const auto& peer : peer_connections) {
+                    send(peer.second, message.c_str(), message.length(), 0);
+                    message_list[msg_hash].sentTo.insert(peer.first);
+                }
+                log_file << "Generated and broadcast message: " << message << endl;
             }
-            
-            log_file << "Generated and broadcast message: " << message << endl;
-            mtx.unlock();
         }
     }
 
+    // This function continuously reads messages from each peer.
+    // It distinguishes between PING/PONG (for liveness) and gossip messages.
     void handleIncomingMessages() {
         while (true) {
-            mtx.lock();
-            auto connections = peer_connections;
-            mtx.unlock();
+            vector<pair<string, int>> connections;
+            {
+                lock_guard<mutex> lock(mtx);
+                for (auto &peer : peer_connections) {
+                    connections.push_back({peer.first, peer.second});
+                }
+            }
 
             for (const auto& peer : connections) {
                 char buffer[1024] = {0};
                 int bytes_read = recv(peer.second, buffer, sizeof(buffer), MSG_DONTWAIT);
-                
                 if (bytes_read > 0) {
                     string message(buffer, bytes_read);
-                    string msg_hash = calculateHash(message);
-                    
-                    mtx.lock();
-                    if (!message_list.count(msg_hash)) {
-                        message_list[msg_hash] = MessageEntry{msg_hash, {}, {peer.first}};
-                        log_file << "Received new message: " << message << " from " << peer.first << endl;
-                        
-                        // Forward to other peers
-                        for (const auto& fwd_peer : peer_connections) {
-                            if (fwd_peer.first != peer.first) {
-                                send(fwd_peer.second, message.c_str(), message.length(), 0);
-                                message_list[msg_hash].sentTo.insert(fwd_peer.first);
+                    if (message == "PING") {
+                        // If a PING is received, respond with PONG.
+                        send(peer.second, "PONG", 4, 0);
+                    } else if (message == "PONG") {
+                        // Mark that a PONG was received for this peer.
+                        lock_guard<mutex> lock(mtx);
+                        ping_received[peer.first] = true;
+                    } else {
+                        // Otherwise, treat the message as a gossip message.
+                        string msg_hash = calculateHash(message);
+                        {
+                            lock_guard<mutex> lock(mtx);
+                            if (!message_list.count(msg_hash)) {
+                                message_list[msg_hash] = MessageEntry{msg_hash, {}, {peer.first}};
+                                log_file << "Received new message: " << message 
+                                         << " from " << peer.first << endl;
+                                // Forward the message to all peers except the sender.
+                                for (const auto& fwd_peer : peer_connections) {
+                                    if (fwd_peer.first != peer.first) {
+                                        send(fwd_peer.second, message.c_str(), message.length(), 0);
+                                        message_list[msg_hash].sentTo.insert(fwd_peer.first);
+                                    }
+                                }
                             }
                         }
                     }
-                    mtx.unlock();
                 }
             }
             this_thread::sleep_for(chrono::milliseconds(100));
         }
     }
 
-    // Connect to selected peers with power-law distribution
+    // Weighted selection and connection to a subset of peers.
     void connectToPeers(const map<string, int>& peer_freq) {
         vector<pair<string, int>> candidates(peer_freq.begin(), peer_freq.end());
-        
-        // Weighted random selection based on frequency
         random_device rd;
         mt19937 gen(rd());
         vector<double> weights;
@@ -154,14 +191,21 @@ private:
         discrete_distribution<> dist(weights.begin(), weights.end());
 
         set<string> selected;
-        while (selected.size() < min(10, (int)candidates.size())) { // Connect to up to 10 peers
+        int num_to_connect = min(10, (int)candidates.size());
+        while ((int)selected.size() < num_to_connect) {
             int idx = dist(gen);
             selected.insert(candidates[idx].first);
         }
 
-        // Establish TCP connections
         for (const string& peer_ip : selected) {
-            int peer_port = connected_peers[peer_ip];
+            int peer_port = 0;
+            {
+                lock_guard<mutex> lock(mtx);
+                if(connected_peers.count(peer_ip))
+                    peer_port = connected_peers[peer_ip];
+                else
+                    continue;
+            }
             int sockfd = socket(AF_INET, SOCK_STREAM, 0);
             sockaddr_in peer_addr;
             peer_addr.sin_family = AF_INET;
@@ -169,20 +213,89 @@ private:
             peer_addr.sin_addr.s_addr = inet_addr(peer_ip.c_str());
 
             if (connect(sockfd, (sockaddr*)&peer_addr, sizeof(peer_addr)) >= 0) {
-                mtx.lock();
+                lock_guard<mutex> lock(mtx);
                 peer_connections[peer_ip] = sockfd;
-                mtx.unlock();
+                // Initialize ping tracking for this peer.
+                ping_failures[peer_ip] = 0;
+                ping_received[peer_ip] = false;
+                log_file << "Connected to peer: " << peer_ip << ":" << peer_port << endl;
+            }
+        }
+    }
+
+    // Accept incoming connections from peers.
+    void acceptPeerConnections() {
+        int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_sock < 0) {
+            cerr << "Error creating listening socket" << endl;
+            return;
+        }
+        
+        int opt = 1;
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+            cerr << "Error setting socket options" << endl;
+            close(listen_sock);
+            return;
+        }
+        
+        sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(self_port);
+        addr.sin_addr.s_addr = INADDR_ANY;
+        if (bind(listen_sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+            cerr << "Error binding listening socket" << endl;
+            close(listen_sock);
+            return;
+        }
+        
+        if (listen(listen_sock, 10) < 0) {
+            cerr << "Error listening on socket" << endl;
+            close(listen_sock);
+            return;
+        }
+        
+        {
+            lock_guard<mutex> lock(mtx);
+            log_file << "Peer listening for incoming connections on port " << self_port << endl;
+        }
+        
+        while (true) {
+            sockaddr_in client_addr;
+            socklen_t addrlen = sizeof(client_addr);
+            int client_sock = accept(listen_sock, (sockaddr*)&client_addr, &addrlen);
+            if (client_sock < 0) {
+                continue;
+            }
+            char client_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+            
+            {
+                lock_guard<mutex> lock(mtx);
+                // If this peer is new, add it.
+                if (peer_connections.find(client_ip) == peer_connections.end()) {
+                    peer_connections[client_ip] = client_sock;
+                    ping_failures[client_ip] = 0;
+                    ping_received[client_ip] = false;
+                    log_file << "Accepted connection from peer: " << client_ip << endl;
+                }
             }
         }
     }
 
 public:
     PeerNode(const string& ip, int port) : self_ip(ip), self_port(port) {
-        log_file.open("peer_" + ip + "_" + to_string(port) + ".log");
+        log_file.open("peer_" + ip + "_" + to_string(port) + ".log", ios::app);
+        if (!log_file) {
+            cerr << "Failed to open log file" << endl;
+        }
     }
 
     void start() {
-        // Read seed nodes from config
+        // Start a thread to accept incoming peer connections.
+        thread accept_thread(&PeerNode::acceptPeerConnections, this);
+        accept_thread.detach();
+        
+        // Read seed nodes from configuration.
         ifstream config("Config.txt");
         vector<pair<string, int>> seed_nodes;
         string line;
@@ -192,46 +305,61 @@ public:
             ss >> ip >> port;
             seed_nodes.push_back({ip, port});
         }
-
-        // Connect to required seeds
+        
+        // Connect to ⌊(n/2)⌋+1 randomly chosen seed nodes.
         int n = seed_nodes.size();
         int required_seeds = (n / 2) + 1;
         shuffle(seed_nodes.begin(), seed_nodes.end(), mt19937(random_device{}()));
         
-        for (int i = 0; i < required_seeds; i++) {
+        // Aggregate peer lists (with frequency count) from seed responses.
+        map<string, int> aggregated_peer_freq;
+        for (int i = 0; i < required_seeds && i < (int)seed_nodes.size(); i++) {
             int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+            if(sockfd < 0) continue;
             sockaddr_in seed_addr;
             seed_addr.sin_family = AF_INET;
             seed_addr.sin_port = htons(seed_nodes[i].second);
             seed_addr.sin_addr.s_addr = inet_addr(seed_nodes[i].first.c_str());
-
+            
             if (connect(sockfd, (sockaddr*)&seed_addr, sizeof(seed_addr)) >= 0) {
-                seed_connections[seed_nodes[i].first] = sockfd;
+                {
+                    lock_guard<mutex> lock(mtx);
+                    seed_connections[seed_nodes[i].first] = sockfd;
+                }
                 
-                // Receive peer list
+                // Receive the peer list from the seed.
                 char buffer[4096] = {0};
-                recv(sockfd, buffer, sizeof(buffer), 0);
-                string peer_list(buffer);
+                int bytes_received = recv(sockfd, buffer, sizeof(buffer), 0);
+                if (bytes_received <= 0) continue;
+                string peer_list_str(buffer, bytes_received);
+                {
+                    lock_guard<mutex> lock(mtx);
+                    log_file << "Received peer list from seed " << seed_nodes[i].first 
+                             << ": " << peer_list_str << endl;
+                }
                 
-                // Count peer frequencies (power-law distribution)
-                map<string, int> peer_freq;
-                stringstream ss(peer_list);
+                // Process the comma-separated peer list.
+                stringstream ss(peer_list_str);
                 string peer_entry;
                 while (getline(ss, peer_entry, ',')) {
                     if (peer_entry.empty()) continue;
                     stringstream ps(peer_entry);
-                    string ip; int port;
-                    ps >> ip >> port;
-                    peer_freq[ip]++;  // Frequency = degree
-                    connected_peers[ip] = port;
+                    string peer_ip; int peer_port;
+                    ps >> peer_ip >> peer_port;
+                    aggregated_peer_freq[peer_ip]++;  // Frequency for weighted selection.
+                    {
+                        lock_guard<mutex> lock(mtx);
+                        if(connected_peers.find(peer_ip) == connected_peers.end())
+                            connected_peers[peer_ip] = peer_port;
+                    }
                 }
-                
-                // Connect to peers
-                connectToPeers(peer_freq);
             }
         }
-
-        // Start threads
+        
+        // Connect to peers based on the aggregated list.
+        connectToPeers(aggregated_peer_freq);
+        
+        // Start threads for pinging, generating messages, and handling incoming messages.
         thread ping_thread(&PeerNode::pingPeers, this);
         thread msg_thread(&PeerNode::generateAndBroadcastMessages, this);
         thread recv_thread(&PeerNode::handleIncomingMessages, this);
@@ -240,7 +368,10 @@ public:
         msg_thread.detach();
         recv_thread.detach();
 
-        while (true) this_thread::sleep_for(chrono::seconds(1));
+        // Keep main thread alive.
+        while (true) {
+            this_thread::sleep_for(chrono::seconds(1));
+        }
     }
 };
 
@@ -249,7 +380,6 @@ int main(int argc, char* argv[]) {
         cout << "Usage: " << argv[0] << " <ip> <port>" << endl;
         return 1;
     }
-
     PeerNode peer(argv[1], atoi(argv[2]));
     peer.start();
     return 0;
