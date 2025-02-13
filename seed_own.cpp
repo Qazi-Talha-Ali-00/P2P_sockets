@@ -60,7 +60,7 @@ void handle_dead_node(string& message) {
     m.unlock();
 
     // Verify if the node is actually dead
-    if (!isalive(dead_ip) || !isalive(dead_ip)) {
+    if (!isalive(dead_ip) && !isalive(dead_ip)) {
         // Remove from peer_list
         m.lock();
         peer_list.erase(dead_ip);
