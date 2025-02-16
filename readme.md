@@ -143,7 +143,7 @@ Example:
 - Implement peer discovery optimization
 
 ## Contributors
-Qazi Talha Ali (B22CS087)
-Yogita Yogesh Mundankar (B22CS068)
+- Qazi Talha Ali (B22CS087)
+- Yogita Yogesh Mundankar (B22CS068)
 
 
